@@ -1,7 +1,6 @@
 name: Build Windows Prime-like ISO
 
 on:
-  push:
   workflow_dispatch:
     inputs:
       iso_url:
@@ -81,14 +80,14 @@ jobs:
           }
 
       # -------------------------------------------------------------
-      # 🚀 نظام التخزين المؤقت (ISO Cache) لتجنب التحميل في كل مرة
+      # 🚀 نظام التخزين المؤقت المثالي (ISO Cache Key Fix)
       # -------------------------------------------------------------
       - name: Cache Windows ISO
         id: cache-iso
         uses: actions/cache@v4
         with:
           path: D:/a/_temp/Windows11.iso
-          key: win11-iso-${{ inputs.iso_sha256 || '768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3' }}
+          key: win11-iso-768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3
 
       - name: Download and verify official Microsoft ISO (Only if Cache Missed)
         if: steps.cache-iso.outputs.cache-hit != 'true'
@@ -96,7 +95,6 @@ jobs:
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           
-          # القيم الافتراضية الصريحة في حال كانت القيمة فارغة من الواجهة
           $defaultUrl = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
           $defaultHash = "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
 
