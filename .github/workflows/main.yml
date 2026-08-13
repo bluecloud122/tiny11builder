@@ -12,7 +12,7 @@ on:
       iso_sha256:
         description: "SHA-256 of the ISO, copied from Microsoft's download information"
         required: false
-        default: "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
+        default: "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32"
         type: string
       edition:
         description: "Edition to keep in the final image"
@@ -81,14 +81,14 @@ jobs:
           }
 
       # -------------------------------------------------------------
-      # 🚀 نظام التخزين المؤقت المثالي (ISO Cache Key Fix)
+      # 🚀 نظام التخزين المؤقت المحدث مع الـ SHA256 الصحيح
       # -------------------------------------------------------------
       - name: Cache Windows ISO
         id: cache-iso
         uses: actions/cache@v4
         with:
           path: D:/a/_temp/Windows11.iso
-          key: win11-iso-768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3
+          key: win11-iso-D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32
 
       - name: Download and verify official Microsoft ISO (Only if Cache Missed)
         if: steps.cache-iso.outputs.cache-hit != 'true'
@@ -97,7 +97,7 @@ jobs:
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           
           $defaultUrl = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
-          $defaultHash = "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
+          $defaultHash = "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32"
 
           $inputUrl = "${{ inputs.iso_url }}"
           $inputHash = "${{ inputs.iso_sha256 }}"
