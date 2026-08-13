@@ -1,7 +1,7 @@
 name: Validate built Tiny11 ISO
 
 on:
-  workflow_dispatch: # تشغيل يدوياً فقط
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -20,17 +20,19 @@ jobs:
           - uefi
 
     steps:
-      - name: Download ISO directly from specified URL
+      - name: Download ISO directly from GitHub API
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p input
           
-          echo "Downloading artifact from provided link..."
-          # ملاحظة: التحميل من أرتيفاكتس GitHub ينزل عادة ملف Zip
-          curl -L -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          echo "Downloading artifact from GitHub API..."
+          curl -L \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             -o input/artifact.zip \
-            "https://github.com/bluecloud122/tiny11builder/actions/runs/31724657114/artifacts/9192733079"
+            "https://api.github.com/repos/bluecloud122/tiny11builder/actions/artifacts/9192733079/zip"
 
           if [[ -f input/artifact.zip ]]; then
             echo "Unzipping downloaded artifact..."
@@ -132,7 +134,7 @@ jobs:
           # Tiny11 ISO boot validation
 
           - Firmware: $FIRMWARE_NAME
-          - Source ISO: Downloaded via custom run ID 31724657114
+          - Source ISO: Downloaded via artifact ID 9192733079
           - VM CPU model: \`$VM_CPU_MODEL\` (Broadwell-class)
           - VM memory: ${VM_MEMORY_MB} MiB
           - VM vCPUs: $VM_VCPUS
