@@ -217,6 +217,8 @@ jobs:
             $content = $content.Replace('$DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"', '$DriveLetter = $env:TINY11_MEDIA_DRIVE')
             $content = $content.Replace('$index = Read-Host "Please enter the image index"', '$index = [int]$env:TINY11_IMAGE_INDEX')
             $content = $content.Replace('$input = Read-Host', '$input = "y"')
+            $content = $content.Replace('Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1', 'if (Test-Path "$ScratchDisk\tiny11\sources\install.esd") { Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }')
+            $content = $content.Replace('Remove-Item "$mainOSDrive\tiny11\sources\install.esd" > $null 2>&1', 'Remove-Item "$mainOSDrive\tiny11\sources\install.esd" -ErrorAction SilentlyContinue')
             $content = [regex]::Replace($content, 'Read-Host[^\r\n]*', '"y"')
             Set-Content -LiteralPath $builderFile -Value $content -Encoding UTF8
           }
