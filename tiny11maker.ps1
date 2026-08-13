@@ -13,10 +13,15 @@
 .PARAMETER SCRATCH
     Drive letter of the desired scratch disk (eg: D)
 
+.PARAMETER LOWRAM
+    Apply conservative settings for 1 GB-class systems. Windows Update,
+    Defender, and image servicing remain available.
+
 .EXAMPLE
     .\tiny11maker.ps1 E D
     .\tiny11maker.ps1 -ISO E -SCRATCH D
     .\tiny11maker.ps1 -SCRATCH D -ISO E
+    .\tiny11maker.ps1 -ISO E -SCRATCH D -LOWRAM
     .\tiny11maker.ps1
 
     *If you ordinal parameters the first one must be the mounted iso. The second is the scratch drive.
@@ -30,8 +35,11 @@
 #---------[ Parameters ]---------#
 param (
     [ValidatePattern('^[c-zC-Z]$')][string]$ISO,
-    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH
+    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH,
+    [switch]$LOWRAM
 )
+
+. "$PSScriptRoot\tiny11LegacyProfile.ps1"
 
 if (-not $SCRATCH) {
     $ScratchDisk = $PSScriptRoot -replace '[\\]+$', ''
@@ -265,12 +273,10 @@ foreach ($package in $packagesToRemove) {
 }
 
 Write-Output "Removing Edge:"
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force | Out-Null
-& 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r' | Out-Null
-& 'icacls' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force | Out-Null
+Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+# Keep the WebView runtime: Settings and other Windows components may depend on it.
 Write-Output "Removing OneDrive:"
 & 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" | Out-Null
 & 'icacls' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
@@ -319,6 +325,9 @@ Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Con
 Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableConsumerAccountStateContent' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
+if ($LOWRAM) {
+    Invoke-Tiny11LowRamProfile
+}
 Write-Output "Enabling Local Accounts on OOBE:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
 Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null

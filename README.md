@@ -42,6 +42,32 @@ C:/path/to/your/tiny11/script.ps1 -ISO <letter> -SCRATCH <letter>
 8. Sit back and relax :)
 9. When the image is completed, you will see it in the folder where the script was extracted, with the name tiny11.iso
 
+### 1 GB-class and older laptops
+
+The regular builder supports a conservative low-RAM profile for older laptops
+with slow disks and about 1 GB of memory:
+
+```powershell
+.\tiny11maker.ps1 -ISO E -SCRATCH D -LOWRAM
+```
+
+This profile disables SysMain, Windows Search, and diagnostic telemetry, turns
+off transparency/animations/background app activity, and keeps service-host
+processes shared to reduce memory overhead. It **does not** disable Windows
+Update, Microsoft Defender, or the component store.
+
+The Core builder also accepts `-LOWRAM`, but Core still removes servicing
+components and disables Windows Update/Defender by design. It is not the right
+choice for a daily-use Toshiba installation.
+
+For a Toshiba LT731B-class machine, use an official x64 Windows 11 ISO that the
+processor can boot, select the regular `tiny11maker.ps1`, and enable `-LOWRAM`.
+The builder can bypass TPM, Secure Boot, CPU, storage, and RAM checks, but it
+cannot add missing CPU instruction support, a 64-bit firmware mode, RAM, or
+drivers. Use a supported older Windows 11 release if a newer release rejects
+the processor during boot, and keep a tested Windows 10 or Linux recovery
+option available.
+
 ---
 
 ## What is removed:
@@ -98,7 +124,7 @@ You will be asked during image creation if you want to enable .net 3.5 support!
 ---
 
 ## Known issues:
-- Although Edge is removed, there are some remnants in the Settings, but the app in itself is deleted. 
+- Although the Edge browser is removed, the WebView runtime is kept because Windows Settings and other system components may depend on it.
 - You might have to update Winget before being able to install any apps, using Microsoft Store.
 - Outlook and Dev Home might reappear after some time. This is an ongoing battle, though the latest script update tries to prevent this more aggressively.
 - If you are using this script on arm64, you might see a glimpse of an error while running the script. This is caused by the fact that the arm64 image doesn't have OneDriveSetup.exe included in the System32 folder.

@@ -21,6 +21,11 @@ on:
           - Pro
           - Education
           - Enterprise
+      low_ram:
+        description: "Apply the 1 GB-class low-RAM profile"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -35,24 +40,23 @@ jobs:
       - name: Check out this workflow
         uses: actions/checkout@v4
 
-      # The fork is checked at a known commit instead of following a moving branch.
-      # The canonical project is NTDEVlabs/tiny11builder; this fork was in sync
-      # with it at the pinned commit when this workflow was written.
-      - name: Check out tiny11builder at a pinned commit
+      # Build the exact revision that triggered this workflow, including local
+      # compatibility changes, instead of silently using an older pinned copy.
+      - name: Check out the builder revision
         uses: actions/checkout@v4
         with:
           repository: bluecloud122/tiny11builder
-          ref: 00e7d8a151a39ccffccab4a267bb81fb3756a01d
+          ref: ${{ github.sha }}
           path: tiny11builder
           fetch-depth: 1
 
       - name: Verify builder source
         shell: powershell
         run: |
-          $expectedCommit = "00e7d8a151a39ccffccab4a267bb81fb3756a01d"
+          $expectedCommit = "${{ github.sha }}"
           $actualCommit = (git -C tiny11builder rev-parse HEAD).Trim()
           if ($actualCommit -ne $expectedCommit) {
-            throw "The tiny11builder commit did not match the pinned commit."
+            throw "The tiny11builder checkout did not match the workflow revision."
           }
 
           $requiredFiles = @(
@@ -163,31 +167,21 @@ jobs:
             '$tasksPath = "$mainOSDrive\scratchdir\Windows\System32\Tasks"'
           )
 
-          # tiny11maker already bypasses TPM and unsupported CPU upgrades.
-          # These additional LabConfig values cover old laptops without Secure
-          # Boot/TPM and low-memory machines, while preserving Windows Update,
-          # Defender, servicing, and the normal (non-Core) image model.
-          if ($content -notmatch "BypassCPUCheck") {
-            $needle = "& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassTPMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null"
-            $compatibility = @'
-            & 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassCPUCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-            & 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassSecureBootCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-            & 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassRAMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-            & 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassStorageCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-            '@
-            $content = $content.Replace($needle, "$needle`r`n$compatibility")
-          }
-
           Set-Content -Path $makerPath -Value $content -Encoding UTF8
           "TINY11_IMAGE_INDEX=$env:TINY11_IMAGE_INDEX" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "TINY11_MEDIA_DRIVE=$env:TINY11_MEDIA_DRIVE" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_LOW_RAM=${{ inputs.low_ram }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build the regular serviceable image
         shell: powershell
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
-          & $makerPath -ISO $env:TINY11_MEDIA_DRIVE -SCRATCH D
+          $profileArgs = @()
+          if ($env:TINY11_LOW_RAM -eq "true") {
+            $profileArgs += "-LOWRAM"
+          }
+          & $makerPath -ISO $env:TINY11_MEDIA_DRIVE -SCRATCH D @profileArgs
           if ($LASTEXITCODE -ne 0) {
             throw "tiny11maker.ps1 failed with exit code $LASTEXITCODE."
           }
@@ -201,8 +195,9 @@ jobs:
           $iso = Get-Item "tiny11builder\tiny11.iso"
           $hash = (Get-FileHash $iso.FullName -Algorithm SHA256).Hash
           @"
-          Builder commit: 00e7d8a151a39ccffccab4a267bb81fb3756a01d
+          Builder commit: ${{ github.sha }}
           Edition: ${{ inputs.edition }}
+          Low-RAM profile: ${{ inputs.low_ram }}
           Output: $($iso.Name)
           Output SHA-256: $hash
           Note: This image bypasses Windows 11 hardware checks for unsupported older CPUs.
