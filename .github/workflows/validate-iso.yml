@@ -76,7 +76,9 @@ jobs:
             qemu-system-x86 \
             qemu-utils \
             socat \
-            unzip
+            tesseract-ocr \
+            unzip \
+            xorriso
 
       - name: Boot-test ISO and capture screenshots
         id: vm-test
@@ -98,19 +100,42 @@ jobs:
 
           mkdir -p "$REPORT_DIR"
           FIRMWARE_ARGS=()
+          MACHINE_ARGS=( -machine pc )
+          ISO_BOOT_REPORT="$REPORT_DIR/iso-boot-report.txt"
+
+          # Record the El Torito boot catalog before launching QEMU. This makes
+          # a missing UEFI entry fail explicitly instead of falling through to
+          # the OVMF shell and being reported as a false PASS.
+          xorriso -indev "$ISO_PATH" -report_el_torito plain \
+            > "$ISO_BOOT_REPORT" 2>&1 || {
+              echo "Could not inspect the ISO El Torito boot catalog." >&2
+              cat "$ISO_BOOT_REPORT" >&2
+              exit 1
+          }
 
           if [[ "$VM_FIRMWARE" == "uefi" ]]; then
-            OVMF_CODE="$(find /usr/share/OVMF -maxdepth 1 -type f \
-              \( -name 'OVMF_CODE_4M.fd' -o -name 'OVMF_CODE.fd' \) \
-              -print -quit)"
-            OVMF_VARS_TEMPLATE="$(find /usr/share/OVMF -maxdepth 1 -type f \
-              \( -name 'OVMF_VARS_4M.fd' -o -name 'OVMF_VARS.fd' \) \
-              -print -quit)"
-            if [[ -z "$OVMF_CODE" || -z "$OVMF_VARS_TEMPLATE" ]]; then
-              echo "Could not find the OVMF UEFI firmware files." >&2
+            OVMF_DIR="/usr/share/OVMF"
+            if [[ -f "$OVMF_DIR/OVMF_CODE_4M.fd" && -f "$OVMF_DIR/OVMF_VARS_4M.fd" ]]; then
+              OVMF_CODE="$OVMF_DIR/OVMF_CODE_4M.fd"
+              OVMF_VARS_TEMPLATE="$OVMF_DIR/OVMF_VARS_4M.fd"
+            elif [[ -f "$OVMF_DIR/OVMF_CODE.fd" && -f "$OVMF_DIR/OVMF_VARS.fd" ]]; then
+              OVMF_CODE="$OVMF_DIR/OVMF_CODE.fd"
+              OVMF_VARS_TEMPLATE="$OVMF_DIR/OVMF_VARS.fd"
+            else
+              echo "Could not find a matching OVMF CODE/VARS firmware pair." >&2
               exit 1
             fi
-            cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
+
+            if ! grep -Eiq 'efi|efisys|bootx64' "$ISO_BOOT_REPORT"; then
+              echo "The ISO El Torito catalog has no detectable UEFI boot entry." >&2
+              cat "$ISO_BOOT_REPORT" >&2
+              exit 1
+            fi
+
+            # q35 is the modern chipset path used by OVMF/Windows guests.
+            # Keep legacy pc/SeaBIOS for the separate BIOS compatibility test.
+            MACHINE_ARGS=( -machine q35 )
+            cp --reflink=auto "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
             FIRMWARE_ARGS=(
               -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
               -drive "if=pflash,format=raw,file=$OVMF_VARS"
@@ -153,7 +178,7 @@ jobs:
 
           qemu-system-x86_64 \
             -name "tiny11-iso-validation-$VM_FIRMWARE" \
-            -machine pc \
+            "${MACHINE_ARGS[@]}" \
             "${ACCELERATION[@]}" \
             -cpu "$VM_CPU_MODEL" \
             -m "$VM_MEMORY_MB" \
@@ -161,7 +186,7 @@ jobs:
             "${FIRMWARE_ARGS[@]}" \
             -drive "file=$ISO_PATH,media=cdrom,readonly=on" \
             -drive "file=$DISK_IMAGE,if=ide,format=qcow2,media=disk" \
-            -boot order=d,menu=off \
+            -boot order=d,menu=on \
             -vga std \
             -display none \
             -monitor "unix:$MONITOR_SOCKET,server,nowait" \
@@ -197,7 +222,32 @@ jobs:
             }
             convert "$ppm" "$png"
             rm -f "$ppm"
+            mean="$(identify -format '%[fx:mean]' "$png")"
+            stddev="$(identify -format '%[fx:standard_deviation]' "$png")"
             identify "$png" | tee -a "$REPORT_DIR/screenshot-info.txt"
+            printf 'mean=%s stddev=%s\n' "$mean" "$stddev" \
+              | tee -a "$REPORT_DIR/screenshot-info.txt"
+
+            # OCR is used only as a failure signal. It catches the exact
+            # UEFI-shell/PXE state seen in the previous validation artifact.
+            ocr_file="$REPORT_DIR/${label}.ocr.txt"
+            tesseract "$png" stdout --psm 6 2>/dev/null \
+              | tr '\n' ' ' > "$ocr_file" || true
+            if grep -Eiq 'UEFI Interactive Shell|Shell>|PXE-E16|No bootable device|BdsDxe.*failed' \
+              "$ocr_file" "$REPORT_DIR/qemu-console.log"; then
+              echo "Detected a boot failure state in $label." >&2
+              return 1
+            fi
+
+            # A live QEMU process can leave a completely black Windows frame
+            # behind. Treat a near-empty final frame as a failed boot test.
+            if [[ "$label" == *-03-install-final ]]; then
+              if awk -v mean="$mean" -v stddev="$stddev" \
+                'BEGIN { exit !((mean + 0) < 0.01 || (stddev + 0) < 0.01) }'; then
+                echo "The final screenshot is effectively blank for $label." >&2
+                return 1
+              fi
+            fi
           }
 
           start_time="$(date +%s)"
@@ -222,7 +272,7 @@ jobs:
 
           ## Result
 
-          **PASS — the guest remained running and produced all three screenshots.**
+          **PASS — the guest produced non-empty final video output without a detected boot-failure state.**
           EOF
 
       - name: Upload ISO validation screenshots and logs
