@@ -93,33 +93,37 @@ jobs:
       - name: Download and verify official Microsoft ISO (Only if Cache Missed)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         shell: powershell
-        env:
-          ISO_URL: ${{ inputs.iso_url }}
-          ISO_SHA256: ${{ inputs.iso_sha256 }}
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
-          Write-Host "Downloading ISO from Microsoft..."
+          $downloadUrl = "${{ inputs.iso_url }}"
+          $expectedHash = "${{ inputs.iso_sha256 }}"
 
-          curl.exe --fail `
-            --location `
-            -C - `
-            --retry 10 `
-            --retry-all-errors `
-            --retry-delay 5 `
-            --connect-timeout 60 `
-            --output $isoPath `
-            $env:ISO_URL
+          if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
+            throw "ISO URL input is empty!"
+          }
+
+          Write-Host "Downloading ISO from Microsoft..."
+          Write-Host "Target URL: $downloadUrl"
+
+          # تشغيل curl بشكل مباشر وسريع في سطر واحد
+          curl.exe --fail --location -C - --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 60 --output $isoPath "$downloadUrl"
 
           if ($LASTEXITCODE -ne 0) {
             throw "Download failed with exit code $LASTEXITCODE."
           }
 
-          if ($env:ISO_SHA256) {
-            $expectedHash = ($env:ISO_SHA256 -replace "\s", "").ToUpperInvariant()
+          if (-not (Test-Path $isoPath)) {
+            throw "Download finished but ISO file was not found at $isoPath"
+          }
+
+          if ($expectedHash) {
+            $cleanExpected = ($expectedHash -replace "\s", "").ToUpperInvariant()
+            Write-Host "Verifying ISO Hash..."
             $actualHash = (Get-FileHash $isoPath -Algorithm SHA256).Hash.ToUpperInvariant()
-            if ($actualHash -ne $expectedHash) {
+            
+            if ($actualHash -ne $cleanExpected) {
               Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
-              throw "ISO SHA-256 mismatch. Expected $expectedHash, got $actualHash."
+              throw "ISO SHA-256 mismatch! Expected $cleanExpected, got $actualHash."
             }
             Write-Host "ISO SHA-256 verified successfully."
           }
