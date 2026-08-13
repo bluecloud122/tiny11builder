@@ -137,8 +137,6 @@ jobs:
           BUILD_PROFILE: ${{ inputs.profile }}
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
-          
-          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           if (-not (Test-Path -LiteralPath $isoPath)) {
             throw "Windows ISO was not found at $isoPath"
           }
@@ -146,44 +144,42 @@ jobs:
           Write-Host "Mounting ISO dynamically..."
           $beforeLetters = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name)
           Mount-DiskImage -ImagePath $isoPath -PassThru -ErrorAction Stop | Out-Null
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 5
 
-          $mediaDriveLetter = (Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue |
-            Get-Disk -ErrorAction SilentlyContinue |
-            Get-Partition -ErrorAction SilentlyContinue |
-            Get-Volume -ErrorAction SilentlyContinue |
-            Where-Object { $_.DriveLetter } |
-            Select-Object -First 1).DriveLetter
+          # Do not trust Get-DiskImage|Get-Volume here: hosted runners can return C:.
+          # Select only a newly visible/cdrom drive that actually contains Windows media.
+          $afterLetters = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name)
+          $candidates = @()
+          $candidates += @($afterLetters | Where-Object { $beforeLetters -notcontains $_ -and $_ -ne "C" })
+          $candidates += @((Get-Volume |
+            Where-Object { $_.DriveType -eq "CD-ROM" -and $_.DriveLetter -and $_.DriveLetter -ne "C" } |
+            Select-Object -ExpandProperty DriveLetter))
 
-          if (-not $mediaDriveLetter) {
-            $afterLetters = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name)
-            $mediaDriveLetter = $afterLetters |
-              Where-Object { $beforeLetters -notcontains $_ -and $_ -ne "C" } |
-              Select-Object -First 1
+          $mediaDriveLetter = $null
+          foreach ($candidate in $candidates) {
+            $letter = ([string]$candidate).Trim().TrimEnd(":")
+            if ($letter.Length -ne 1) { continue }
+            $letter = $letter.Substring(0, 1).ToUpperInvariant()
+            $candidateRoot = $letter + ":\\"
+            if ((Test-Path -LiteralPath (Join-Path $candidateRoot "sources\install.wim")) -or
+                (Test-Path -LiteralPath (Join-Path $candidateRoot "sources\install.esd"))) {
+              $mediaDriveLetter = $letter
+              break
+            }
           }
 
           if (-not $mediaDriveLetter) {
-            $mediaDriveLetter = (Get-Volume |
-              Where-Object { $_.DriveType -eq "CD-ROM" -and $_.DriveLetter -and $_.DriveLetter -ne "C" } |
-              Select-Object -First 1).DriveLetter
+            Write-Host "Drive candidates: $($candidates -join ', ')"
+            throw "Could not find a mounted ISO drive containing sources\install.wim or sources\install.esd."
           }
 
-          if (-not $mediaDriveLetter) {
-            throw "Dynamic Drive Detection Failed: Could not identify the mounted ISO drive."
-          }
-
-          $mediaDriveLetter = ([string]$mediaDriveLetter).Trim().TrimEnd(":").Substring(0, 1).ToUpperInvariant()
-          $mediaDrive = $mediaDriveLetter + ":"
+          $mediaDrive = $mediaDriveLetter + ":\\"
           Write-Host "Detected ISO Drive: $mediaDrive"
 
           $imagePath = @(
-            "$mediaDrive\sources\install.wim",
-            "$mediaDrive\sources\install.esd"
+            (Join-Path $mediaDrive "sources\install.wim"),
+            (Join-Path $mediaDrive "sources\install.esd")
           ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-
-          if (-not $imagePath) {
-            throw "No install.wim or install.esd found in $mediaDrive\sources"
-          }
 
           $images = @(Get-WindowsImage -ImagePath $imagePath -ErrorAction Stop)
           if ($images.Count -eq 0) {
@@ -225,10 +221,14 @@ jobs:
             Set-Content -LiteralPath $builderFile -Value $content -Encoding UTF8
           }
 
+          $requestedLowRam = "${{ inputs.low_ram }}"
+          $requestedProfile = "${{ inputs.profile }}"
+          $lowRam = if ([string]::IsNullOrWhiteSpace($requestedLowRam)) { "false" } else { $requestedLowRam }
+          $profile = if ([string]::IsNullOrWhiteSpace($requestedProfile)) { "Regular" } else { $requestedProfile }
           "TINY11_IMAGE_INDEX=$env:TINY11_IMAGE_INDEX" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "TINY11_MEDIA_DRIVE=$env:TINY11_MEDIA_DRIVE" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "TINY11_LOW_RAM=\${{ inputs.low_ram }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "TINY11_PROFILE=\${{ inputs.profile }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_LOW_RAM=$lowRam" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_PROFILE=$profile" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build the selected image profile
         shell: powershell
         run: |
