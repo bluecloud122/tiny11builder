@@ -259,15 +259,15 @@ jobs:
           $iso = Get-ChildItem -Path $PWD -Filter "*.iso" -Recurse | Select-Object -First 1
           if ($iso) {
             $hash = (Get-FileHash $iso.FullName -Algorithm SHA256).Hash
-            @"
-            Builder commit: ${{ github.sha }}
-            Edition: ${{ inputs.edition }}
-            Profile: ${{ inputs.profile }}
-            Output: $($iso.Name)
-            Output SHA-256: $hash
-            "@ | Set-Content "tiny11builder\tiny11-build-info.txt" -Encoding UTF8
+            $metadata = @(
+              "Builder commit: ${{ github.sha }}"
+              "Edition: ${{ inputs.edition }}"
+              "Profile: ${{ inputs.profile }}"
+              "Output: $($iso.Name)"
+              "Output SHA-256: $hash"
+            )
+            $metadata | Set-Content "tiny11builder\tiny11-build-info.txt" -Encoding UTF8
           }
-
       - name: Upload ISO Artifact
         uses: actions/upload-artifact@v4
         with:
