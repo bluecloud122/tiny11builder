@@ -132,6 +132,17 @@ jobs:
           }
 
           $mediaDrive = "$drive`:"
+          $requiredBootFiles = @(
+            (Join-Path $mediaDrive "boot\etfsboot.com"),
+            (Join-Path $mediaDrive "efi\microsoft\boot\efisys.bin")
+          )
+          foreach ($bootFile in $requiredBootFiles) {
+            if (-not (Test-Path $bootFile)) {
+              throw "The source ISO is missing a required BIOS/UEFI boot file: $bootFile"
+            }
+          }
+          Write-Host "Verified legacy BIOS and UEFI boot files in the source ISO."
+
           $wimPath = Join-Path $mediaDrive "sources\install.wim"
           $esdPath = Join-Path $mediaDrive "sources\install.esd"
           if (Test-Path $wimPath) {
@@ -201,6 +212,7 @@ jobs:
           Builder commit: ${{ github.sha }}
           Edition: ${{ inputs.edition }}
           Low-RAM profile: ${{ inputs.low_ram }}
+          Boot modes: Legacy BIOS and UEFI (dual El Torito entries)
           Output: $($iso.Name)
           Output SHA-256: $hash
           Note: This image bypasses Windows 11 hardware checks for unsupported older CPUs.

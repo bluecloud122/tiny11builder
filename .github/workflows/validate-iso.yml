@@ -1,0 +1,243 @@
+name: Validate built Tiny11 ISO
+
+on:
+  workflow_run:
+    workflows:
+      - Build Windows Prime-like ISO
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  boot-test:
+    name: Boot-test ISO in a 5th-gen Intel-like ${{ matrix.firmware }} VM
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware:
+          - bios
+          - uefi
+
+    steps:
+      - name: Download ISO from the completed build
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-prime-like-iso
+          path: input
+          github-token: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Locate and hash the ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-output
+
+          mapfile -t iso_files < <(find input -type f -iname '*.iso' -print)
+          if [[ "${#iso_files[@]}" -ne 1 ]]; then
+            printf 'Expected exactly one ISO, found %s:\n' "${#iso_files[@]}" >&2
+            printf '  %s\n' "${iso_files[@]-}" >&2
+            exit 1
+          fi
+
+          ISO_PATH="${iso_files[0]}"
+          ISO_SIZE="$(stat -c '%s' "$ISO_PATH")"
+          if [[ "$ISO_SIZE" -lt 1048576 ]]; then
+            echo "The downloaded ISO is unexpectedly small: ${ISO_SIZE} bytes." >&2
+            exit 1
+          fi
+
+          printf 'ISO path: %s\nISO size: %s bytes\n' "$ISO_PATH" "$ISO_SIZE" \
+            | tee validation-output/input-info.txt
+          sha256sum "$ISO_PATH" | tee validation-output/input-sha256.txt
+          printf 'ISO_PATH=%s\n' "$ISO_PATH" >> "$GITHUB_ENV"
+
+      - name: Install QEMU and screenshot tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            imagemagick \
+            ovmf \
+            qemu-system-x86 \
+            qemu-utils \
+            socat
+
+      - name: Boot-test ISO and capture screenshots
+        id: vm-test
+        shell: bash
+        env:
+          VM_CPU_MODEL: Broadwell
+          VM_MEMORY_MB: "4096"
+          VM_VCPUS: "2"
+          VM_FIRMWARE: ${{ matrix.firmware }}
+        run: |
+          set -Eeuo pipefail
+
+          REPORT_DIR="$GITHUB_WORKSPACE/validation-output"
+          DISK_IMAGE="$RUNNER_TEMP/tiny11-validation-${VM_FIRMWARE}.qcow2"
+          OVMF_VARS="$RUNNER_TEMP/OVMF_VARS-${VM_FIRMWARE}.fd"
+          MONITOR_SOCKET="$RUNNER_TEMP/tiny11-qemu-monitor-${VM_FIRMWARE}.sock"
+          SERIAL_LOG="$REPORT_DIR/qemu-serial.log"
+          SUMMARY="$REPORT_DIR/validation-summary.md"
+
+          mkdir -p "$REPORT_DIR"
+          FIRMWARE_ARGS=()
+
+          if [[ "$VM_FIRMWARE" == "uefi" ]]; then
+            OVMF_CODE="$(find /usr/share/OVMF -maxdepth 1 -type f \
+              \( -name 'OVMF_CODE_4M.fd' -o -name 'OVMF_CODE.fd' \) \
+              -print -quit)"
+            OVMF_VARS_TEMPLATE="$(find /usr/share/OVMF -maxdepth 1 -type f \
+              \( -name 'OVMF_VARS_4M.fd' -o -name 'OVMF_VARS.fd' \) \
+              -print -quit)"
+            if [[ -z "$OVMF_CODE" || -z "$OVMF_VARS_TEMPLATE" ]]; then
+              echo "Could not find the OVMF UEFI firmware files." >&2
+              exit 1
+            fi
+            cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
+            FIRMWARE_ARGS=(
+              -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+              -drive "if=pflash,format=raw,file=$OVMF_VARS"
+            )
+            FIRMWARE_NAME="UEFI"
+          else
+            # No pflash device is supplied here, so QEMU uses SeaBIOS and exercises
+            # the ISO's El Torito legacy BIOS entry.
+            FIRMWARE_NAME="SeaBIOS legacy BIOS"
+          fi
+
+          qemu-img create -f qcow2 "$DISK_IMAGE" 32G
+
+          if [[ -e /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+            ACCELERATION=( -accel kvm )
+            ACCELERATION_NAME="KVM"
+          else
+            ACCELERATION=( -accel tcg,thread=multi )
+            ACCELERATION_NAME="QEMU TCG software emulation"
+          fi
+
+          cat > "$SUMMARY" <<EOF
+          # Tiny11 ISO boot validation
+
+          - Firmware: $FIRMWARE_NAME
+          - Source workflow run: ${{ github.event.workflow_run.html_url }}
+          - Source commit: ${{ github.event.workflow_run.head_sha }}
+          - VM CPU model: \`$VM_CPU_MODEL\` (Broadwell-class, used as a 5th-generation Intel-like smoke-test profile)
+          - VM memory: ${VM_MEMORY_MB} MiB
+          - VM vCPUs: $VM_VCPUS
+          - Acceleration: $ACCELERATION_NAME
+          - Guest disk: 32 GiB dynamically allocated QCOW2
+
+          This validates that the ISO can start in a $FIRMWARE_NAME x64 VM long enough
+          to produce three display captures. It does not certify Toshiba-specific
+          drivers, battery behavior, Wi-Fi, sound, sleep, or long-term installation
+          stability.
+          EOF
+
+          cleanup() {
+            if [[ -n "${QEMU_PID:-}" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+              printf 'quit\n' | socat - "UNIX-CONNECT:$MONITOR_SOCKET" >/dev/null 2>&1 || true
+              kill "$QEMU_PID" 2>/dev/null || true
+              wait "$QEMU_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          qemu-system-x86_64 \
+            -name "tiny11-iso-validation-$VM_FIRMWARE" \
+            -machine pc \
+            "${ACCELERATION[@]}" \
+            -cpu "$VM_CPU_MODEL" \
+            -m "$VM_MEMORY_MB" \
+            -smp "$VM_VCPUS" \
+            "${FIRMWARE_ARGS[@]}" \
+            -drive "file=$ISO_PATH,media=cdrom,readonly=on" \
+            -drive "file=$DISK_IMAGE,if=ide,format=qcow2,media=disk" \
+            -boot order=d,menu=off \
+            -vga std \
+            -display none \
+            -monitor "unix:$MONITOR_SOCKET,server,nowait" \
+            -serial "file:$SERIAL_LOG" \
+            -no-reboot \
+            > "$REPORT_DIR/qemu-console.log" 2>&1 &
+          QEMU_PID=$!
+
+          for _ in $(seq 1 30); do
+            [[ -S "$MONITOR_SOCKET" ]] && break
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "QEMU exited before its monitor became ready." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          [[ -S "$MONITOR_SOCKET" ]] || {
+            echo "QEMU monitor socket did not become ready." >&2
+            exit 1
+          }
+
+          capture_screen() {
+            local label="$1"
+            local ppm="$REPORT_DIR/${label}.ppm"
+            local png="$REPORT_DIR/${label}.png"
+
+            printf 'screendump %s\n' "$ppm" \
+              | socat - "UNIX-CONNECT:$MONITOR_SOCKET"
+            sleep 2
+            [[ -s "$ppm" ]] || {
+              echo "QEMU produced an empty screenshot for $label." >&2
+              return 1
+            }
+            convert "$ppm" "$png"
+            rm -f "$ppm"
+            identify "$png" | tee -a "$REPORT_DIR/screenshot-info.txt"
+          }
+
+          start_time="$(date +%s)"
+          for capture in "01-install-start:45" "02-install-progress:180" "03-install-final:420"; do
+            label="${VM_FIRMWARE}-${capture%%:*}"
+            target_seconds="${capture##*:}"
+            elapsed="$(( $(date +%s) - start_time ))"
+            remaining="$(( target_seconds - elapsed ))"
+            if (( remaining > 0 )); then
+              sleep "$remaining"
+            fi
+
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "QEMU exited before $label; the ISO did not remain bootable." >&2
+              exit 1
+            fi
+            capture_screen "$label"
+            echo "Captured $label."
+          done
+
+          cat >> "$SUMMARY" <<'EOF'
+
+          ## Result
+
+          **PASS — the guest remained running and produced all three screenshots.**
+
+          Review the screenshots and `qemu-serial.log` before installing on physical
+          hardware. Keep a Windows 10 or Linux recovery option available because
+          bypassing Windows 11 checks does not add missing firmware, memory, CPU
+          instructions, or device drivers.
+          EOF
+
+      - name: Upload ISO validation screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-iso-validation-${{ github.event.workflow_run.id }}-${{ matrix.firmware }}
+          path: validation-output
+          if-no-files-found: warn
+          retention-days: 14
