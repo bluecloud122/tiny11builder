@@ -6,12 +6,12 @@ on:
     inputs:
       iso_url:
         description: "Direct HTTPS URL for the official Microsoft Windows 11 ISO"
-        required: true
+        required: false
         default: "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
         type: string
       iso_sha256:
         description: "SHA-256 of the ISO, copied from Microsoft's download information"
-        required: true
+        required: false
         default: "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
         type: string
       edition:
@@ -88,24 +88,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: D:/a/_temp/Windows11.iso
-          key: win11-iso-${{ inputs.iso_sha256 }}
+          key: win11-iso-${{ inputs.iso_sha256 || '768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3' }}
 
       - name: Download and verify official Microsoft ISO (Only if Cache Missed)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         shell: powershell
+        env:
+          RAW_ISO_URL: ${{ inputs.iso_url }}
+          RAW_ISO_SHA256: ${{ inputs.iso_sha256 }}
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
-          $downloadUrl = "${{ inputs.iso_url }}"
-          $expectedHash = "${{ inputs.iso_sha256 }}"
+          
+          # تعيين القيم الافتراضية في حال كانت المدخلات فارغة
+          $defaultUrl = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
+          $defaultHash = "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
 
-          if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
-            throw "ISO URL input is empty!"
-          }
+          $downloadUrl = if ([string]::IsNullOrWhiteSpace($env:RAW_ISO_URL)) { $defaultUrl } else { $env:RAW_ISO_URL }
+          $expectedHash = if ([string]::IsNullOrWhiteSpace($env:RAW_ISO_SHA256)) { $defaultHash } else { $env:RAW_ISO_SHA256 }
 
           Write-Host "Downloading ISO from Microsoft..."
           Write-Host "Target URL: $downloadUrl"
 
-          # تشغيل curl بشكل مباشر وسريع في سطر واحد
           curl.exe --fail --location -C - --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 60 --output $isoPath "$downloadUrl"
 
           if ($LASTEXITCODE -ne 0) {
