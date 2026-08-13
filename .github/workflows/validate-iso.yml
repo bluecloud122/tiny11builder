@@ -299,14 +299,13 @@ jobs:
               return 1
             fi
 
-            # A live QEMU process can leave a completely black Windows frame
-            # behind. Treat a near-empty final frame as a failed boot test.
-            if [[ "$label" == *-03-install-final ]]; then
-              if awk -v mean="$mean" -v stddev="$stddev" \
-                'BEGIN { exit !((mean + 0) < 0.01 || (stddev + 0) < 0.01) }'; then
-                echo "The final screenshot is effectively blank for $label." >&2
-                return 1
-              fi
+             # A live QEMU process can leave a completely black Windows frame
+             # behind after the initial logo. Treat any truly blank frame as a
+             # failed boot, not just the final frame.
+             if awk -v mean="$mean" -v stddev="$stddev" \
+               'BEGIN { exit !((mean + 0) < 0.001 && (stddev + 0) < 0.001) }'; then
+               echo "The screenshot is effectively blank for $label." >&2
+               return 1
             fi
           }
 
