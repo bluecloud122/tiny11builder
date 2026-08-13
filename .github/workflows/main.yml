@@ -1,0 +1,224 @@
+name: Build Windows Prime-like ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "Direct HTTPS URL for the official Microsoft Windows 11 ISO"
+        required: true
+        type: string
+      iso_sha256:
+        description: "SHA-256 of the ISO, copied from Microsoft's download information"
+        required: true
+        type: string
+      edition:
+        description: "Edition to keep in the final image"
+        required: true
+        default: "Pro"
+        type: choice
+        options:
+          - Home
+          - Pro
+          - Education
+          - Enterprise
+      low_ram:
+        description: "Apply the 1 GB-class low-RAM profile"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build trimmed Windows 11 image
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out this workflow
+        uses: actions/checkout@v4
+
+      # Build the exact revision that triggered this workflow, including local
+      # compatibility changes, instead of silently using an older pinned copy.
+      - name: Check out the builder revision
+        uses: actions/checkout@v4
+        with:
+          repository: bluecloud122/tiny11builder
+          ref: ${{ github.sha }}
+          path: tiny11builder
+          fetch-depth: 1
+
+      - name: Verify builder source
+        shell: powershell
+        run: |
+          $expectedCommit = "${{ github.sha }}"
+          $actualCommit = (git -C tiny11builder rev-parse HEAD).Trim()
+          if ($actualCommit -ne $expectedCommit) {
+            throw "The tiny11builder checkout did not match the workflow revision."
+          }
+
+          $requiredFiles = @(
+            "tiny11builder\tiny11maker.ps1",
+            "tiny11builder\autounattend.xml"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Required builder file is missing: $file"
+            }
+          }
+
+          $builderHash = (Get-FileHash "tiny11builder\tiny11maker.ps1" -Algorithm SHA256).Hash
+          Write-Host "Verified tiny11maker.ps1 SHA-256: $builderHash"
+
+      - name: Download and verify official Microsoft ISO
+        shell: powershell
+        env:
+          ISO_URL: ${{ inputs.iso_url }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+        run: |
+          $uri = [Uri]$env:ISO_URL
+          $trustedHosts = @(
+            "download.microsoft.com",
+            "software.download.prss.microsoft.com",
+            "software-download.microsoft.com"
+          )
+
+          if ($uri.Scheme -ne "https") {
+            throw "The ISO URL must use HTTPS."
+          }
+          if ($trustedHosts -notcontains $uri.DnsSafeHost.ToLowerInvariant()) {
+            throw "Refusing to download from an untrusted host: $($uri.DnsSafeHost). Use a direct Microsoft ISO URL."
+          }
+
+          $expectedHash = ($env:ISO_SHA256 -replace "\s", "").ToUpperInvariant()
+          if ($expectedHash -notmatch "^[A-F0-9]{64}$") {
+            throw "iso_sha256 must be exactly 64 hexadecimal characters."
+          }
+
+          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
+          Write-Host "Downloading the official ISO from $($uri.DnsSafeHost)..."
+          Invoke-WebRequest -Uri $env:ISO_URL -OutFile $isoPath -UseBasicParsing
+
+          $actualHash = (Get-FileHash $isoPath -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actualHash -ne $expectedHash) {
+            Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
+            throw "ISO SHA-256 mismatch. Expected $expectedHash, got $actualHash."
+          }
+          Write-Host "ISO SHA-256 verified: $actualHash"
+
+      - name: Select edition and prepare compatibility improvements
+        shell: powershell
+        env:
+          TARGET_EDITION: ${{ inputs.edition }}
+        run: |
+          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
+          Mount-DiskImage -ImagePath $isoPath | Out-Null
+          Start-Sleep -Seconds 3
+          $drive = (
+            Get-DiskImage -ImagePath $isoPath |
+              Get-Disk |
+              Get-Partition |
+              Get-Volume |
+              Where-Object DriveLetter |
+              Select-Object -First 1
+          ).DriveLetter
+          if (-not $drive) {
+            throw "Windows could not assign a drive letter to the ISO."
+          }
+
+          $mediaDrive = "$drive`:"
+          $wimPath = Join-Path $mediaDrive "sources\install.wim"
+          $esdPath = Join-Path $mediaDrive "sources\install.esd"
+          if (Test-Path $wimPath) {
+            $imagePath = $wimPath
+          } elseif (Test-Path $esdPath) {
+            $imagePath = $esdPath
+          } else {
+            throw "The mounted ISO has no install.wim or install.esd."
+          }
+
+          $images = @(Get-WindowsImage -ImagePath $imagePath)
+          $selected = $images | Where-Object {
+            $_.ImageName -match [Regex]::Escape($env:TARGET_EDITION) -or
+            $_.ImageDescription -match [Regex]::Escape($env:TARGET_EDITION)
+          } | Select-Object -First 1
+
+          if (-not $selected) {
+            $available = ($images | ForEach-Object { "$($_.ImageIndex): $($_.ImageName)" }) -join "; "
+            throw "Edition '$env:TARGET_EDITION' was not found. Available images: $available"
+          }
+
+          $env:TINY11_IMAGE_INDEX = [string]$selected.ImageIndex
+          $env:TINY11_MEDIA_DRIVE = $drive
+          Write-Host "Selected image index $env:TINY11_IMAGE_INDEX`: $($selected.ImageName)"
+
+          # Make the upstream builder non-interactive for CI and fix its task path
+          # so it always targets the mounted image, not C:\scratchdir.
+          $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
+          $content = Get-Content $makerPath -Raw
+          $content = $content.Replace(
+            '$index = Read-Host "Please enter the image index"',
+            '$index = [int]$env:TINY11_IMAGE_INDEX'
+          )
+          $content = $content.Replace(
+            '$tasksPath = "C:\scratchdir\Windows\System32\Tasks"',
+            '$tasksPath = "$mainOSDrive\scratchdir\Windows\System32\Tasks"'
+          )
+
+          Set-Content -Path $makerPath -Value $content -Encoding UTF8
+          "TINY11_IMAGE_INDEX=$env:TINY11_IMAGE_INDEX" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_MEDIA_DRIVE=$env:TINY11_MEDIA_DRIVE" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_LOW_RAM=${{ inputs.low_ram }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the regular serviceable image
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
+          $profileArgs = @()
+          if ($env:TINY11_LOW_RAM -eq "true") {
+            $profileArgs += "-LOWRAM"
+          }
+          & $makerPath -ISO $env:TINY11_MEDIA_DRIVE -SCRATCH D @profileArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "tiny11maker.ps1 failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path "tiny11builder\tiny11.iso")) {
+            throw "The build finished without creating tiny11.iso."
+          }
+
+      - name: Write build metadata
+        shell: powershell
+        run: |
+          $iso = Get-Item "tiny11builder\tiny11.iso"
+          $hash = (Get-FileHash $iso.FullName -Algorithm SHA256).Hash
+          @"
+          Builder commit: ${{ github.sha }}
+          Edition: ${{ inputs.edition }}
+          Low-RAM profile: ${{ inputs.low_ram }}
+          Output: $($iso.Name)
+          Output SHA-256: $hash
+          Note: This image bypasses Windows 11 hardware checks for unsupported older CPUs.
+          It does not activate Windows and remains subject to Microsoft's license terms.
+          "@ | Set-Content "tiny11builder\tiny11-build-info.txt" -Encoding UTF8
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-prime-like-iso
+          path: |
+            tiny11builder/tiny11.iso
+            tiny11builder/tiny11-build-info.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Dismount source ISO
+        if: always()
+        shell: powershell
+        run: |
+          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
+          if (Test-Path $isoPath) {
+            Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+          }
