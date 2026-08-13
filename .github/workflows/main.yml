@@ -75,18 +75,29 @@ jobs:
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path $file)) {
-              Write-Warning "File missing: $file - Attempting fallback/continue..."
+              Write-Warning "File missing: $file"
             }
           }
 
-      - name: Download and verify official Microsoft ISO
+      # -------------------------------------------------------------
+      # 🚀 نظام التخزين المؤقت (ISO Cache) لتجنب التحميل في كل مرة
+      # -------------------------------------------------------------
+      - name: Cache Windows ISO
+        id: cache-iso
+        uses: actions/cache@v4
+        with:
+          path: D:/a/_temp/Windows11.iso
+          key: win11-iso-${{ inputs.iso_sha256 }}
+
+      - name: Download and verify official Microsoft ISO (Only if Cache Missed)
+        if: steps.cache-iso.outputs.cache-hit != 'true'
         shell: powershell
         env:
           ISO_URL: ${{ inputs.iso_url }}
           ISO_SHA256: ${{ inputs.iso_sha256 }}
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
-          Write-Host "Downloading ISO..."
+          Write-Host "Downloading ISO from Microsoft..."
 
           curl.exe --fail `
             --location `
@@ -106,10 +117,10 @@ jobs:
             $expectedHash = ($env:ISO_SHA256 -replace "\s", "").ToUpperInvariant()
             $actualHash = (Get-FileHash $isoPath -Algorithm SHA256).Hash.ToUpperInvariant()
             if ($actualHash -ne $expectedHash) {
-              Write-Warning "SHA256 mismatch! Expected: $expectedHash, Got: $actualHash. Proceeding dynamically."
-            } else {
-              Write-Host "ISO SHA-256 verified successfully."
+              Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
+              throw "ISO SHA-256 mismatch. Expected $expectedHash, got $actualHash."
             }
+            Write-Host "ISO SHA-256 verified successfully."
           }
 
       - name: Select edition and prepare compatibility improvements (Fully Flexible)
@@ -120,23 +131,21 @@ jobs:
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           
-          # 1. التقاط محركات الأقراص الموجودة قبل التثبيت
+          # 1. التقاط الأقراص الموجودة بالنظام قبل الـ Mount
           $beforeDrives = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
           
           Write-Host "Mounting ISO dynamically..."
           Mount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue | Out-Null
           Start-Sleep -Seconds 5
 
-          # 2. تحديد المحرك الجديد تلقائياً بمقارنة الأقراص قبل وبعد التثبيت
+          # 2. جلب الحرف المخصص للـ ISO مع استبعاد قرص C
           $afterDrives = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
           $newDrive = ($afterDrives | Where-Object { $beforeDrives -notcontains $_ -and $_ -ne 'C' }) | Select-Object -First 1
 
-          # كخيار احتياطي ثانٍ: الحصول على أقراص DVD/CDROM المتاحة
           if (-not $newDrive) {
             $newDrive = (Get-Volume | Where-Object { $_.DriveType -eq 'CD-ROM' -and $_.DriveLetter -and $_.DriveLetter -ne 'C' } | Select-Object -First 1).DriveLetter
           }
 
-          # كخيار احتياطي ثالث: البحث عن أول محرك ليس C يحتوي على مجلد sources
           if (-not $newDrive) {
             $newDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -ne 'C' -and (Test-Path "$($_.Name):\sources") } | Select-Object -First 1).Name
           }
@@ -148,16 +157,14 @@ jobs:
           $mediaDrive = "$newDrive`:"
           Write-Host "Detected ISO Drive: $mediaDrive"
 
-          # 3. مرونة في تحديد ملف الصورة (install.wim أو install.esd)
+          # 3. التأكد من ملف الصورة
           $imagePath = Get-ChildItem -Path "$mediaDrive\sources" -Include "install.wim", "install.esd" -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
 
           if (-not $imagePath) {
             throw "No valid install.wim or install.esd found in $mediaDrive"
           }
 
-          Write-Host "Found image file at: $imagePath"
-
-          # 4. اختيار الطبعة المرن (أي تطابق جزئي أو تقريبي)
+          # 4. تحديد الإصدار المطلوب (Edition)
           $images = @(Get-WindowsImage -ImagePath $imagePath)
           $selected = $images | Where-Object {
             $_.ImageName -like "*$env:TARGET_EDITION*" -or
@@ -170,15 +177,17 @@ jobs:
           }
 
           $env:TINY11_IMAGE_INDEX = [string]$selected.ImageIndex
-          $env:TINY11_MEDIA_DRIVE = $newDrive
+          $env:TINY11_MEDIA_DRIVE = $mediaDrive
           Write-Host "Selected Image Index: $env:TINY11_IMAGE_INDEX ($($selected.ImageName))"
 
-          # 5. التعديل الديناميكي المرن لملفات tiny11builder عبر Regex بدلاً من النمط الثابت
+          # 5. تعديل السكريبتات وتمرير الحرف ورقم الإصدار بدون أسئلة تفاعلية
           $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
           if (Test-Path $makerPath) {
             $content = Get-Content $makerPath -Raw
+            $content = [Regex]::Replace($content, '(\$driveLetter\s*=\s*)Read-Host[^\r\n]*', "`$1 `"$env:TINY11_MEDIA_DRIVE`"")
             $content = [Regex]::Replace($content, '(\$index\s*=\s*)Read-Host[^\r\n]*', "`$1 [int]$env:TINY11_IMAGE_INDEX")
             $content = [Regex]::Replace($content, 'C:\\scratchdir', '$mainOSDrive\scratchdir')
+            $content = [Regex]::Replace($content, 'Read-Host[^\r\n]*', '"y"')
             Set-Content -Path $makerPath -Value $content -Encoding UTF8
           }
 
@@ -200,21 +209,17 @@ jobs:
         shell: powershell
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
-          try {
-            if ($env:TINY11_PROFILE -eq "Core") {
-              Write-Host "Building Core Profile..."
-              $builderPath = Join-Path $PWD "tiny11builder\tiny11Coremaker.ps1"
-              & $builderPath
-            } else {
-              Write-Host "Building Regular Profile..."
-              $builderPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
-              & $builderPath -ISO $env:TINY11_MEDIA_DRIVE -SCRATCH "D"
-            }
-          } catch {
-            Write-Warning "Builder experienced a non-fatal warning or completed with soft alerts: $_"
+          
+          if ($env:TINY11_PROFILE -eq "Core") {
+            Write-Host "Building Core Profile..."
+            $builderPath = Join-Path $PWD "tiny11builder\tiny11Coremaker.ps1"
+            & $builderPath
+          } else {
+            Write-Host "Building Regular Profile..."
+            $builderPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
+            & $builderPath
           }
 
-          # البحث عن أي ملف ISO تم توليده ديناميكياً
           $generatedIso = Get-ChildItem -Path $PWD -Filter "*.iso" -Recurse | Select-Object -First 1
           if (-not $generatedIso) {
             throw "Fatal: Build completed but no output ISO file was found."
@@ -243,7 +248,7 @@ jobs:
           path: |
             **/*.iso
             tiny11builder/tiny11-build-info.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
       - name: Dismount source ISO safely
