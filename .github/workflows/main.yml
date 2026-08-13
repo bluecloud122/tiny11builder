@@ -1,6 +1,7 @@
 name: Build Windows Prime-like ISO
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       iso_url:
