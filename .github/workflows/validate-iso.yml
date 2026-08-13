@@ -1,12 +1,7 @@
 name: Validate built Tiny11 ISO
 
 on:
-  workflow_dispatch:
-  workflow_run:
-    workflows:
-      - Build Windows Prime-like ISO
-    types:
-      - completed
+  workflow_dispatch: # تشغيل يدوياً فقط
 
 permissions:
   actions: read
@@ -15,9 +10,6 @@ permissions:
 jobs:
   boot-test:
     name: Boot-test ISO in a 5th-gen Intel-like ${{ matrix.firmware }} VM
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
@@ -28,14 +20,23 @@ jobs:
           - uefi
 
     steps:
-      - name: Download ISO from the completed build
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-prime-like-iso
-          path: input
-          github-token: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
-          repository: ${{ github.repository }}
-          run-id: ${{ github.event.workflow_run.id }}
+      - name: Download ISO directly from specified URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          
+          echo "Downloading artifact from provided link..."
+          # ملاحظة: التحميل من أرتيفاكتس GitHub ينزل عادة ملف Zip
+          curl -L -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -o input/artifact.zip \
+            "https://github.com/bluecloud122/tiny11builder/actions/runs/31724657114/artifacts/9192733079"
+
+          if [[ -f input/artifact.zip ]]; then
+            echo "Unzipping downloaded artifact..."
+            unzip -o input/artifact.zip -d input/
+            rm input/artifact.zip
+          fi
 
       - name: Locate and hash the ISO
         shell: bash
@@ -72,7 +73,8 @@ jobs:
             ovmf \
             qemu-system-x86 \
             qemu-utils \
-            socat
+            socat \
+            unzip
 
       - name: Boot-test ISO and capture screenshots
         id: vm-test
@@ -113,8 +115,6 @@ jobs:
             )
             FIRMWARE_NAME="UEFI"
           else
-            # No pflash device is supplied here, so QEMU uses SeaBIOS and exercises
-            # the ISO's El Torito legacy BIOS entry.
             FIRMWARE_NAME="SeaBIOS legacy BIOS"
           fi
 
@@ -132,18 +132,12 @@ jobs:
           # Tiny11 ISO boot validation
 
           - Firmware: $FIRMWARE_NAME
-          - Source workflow run: ${{ github.event.workflow_run.html_url }}
-          - Source commit: ${{ github.event.workflow_run.head_sha }}
-          - VM CPU model: \`$VM_CPU_MODEL\` (Broadwell-class, used as a 5th-generation Intel-like smoke-test profile)
+          - Source ISO: Downloaded via custom run ID 31724657114
+          - VM CPU model: \`$VM_CPU_MODEL\` (Broadwell-class)
           - VM memory: ${VM_MEMORY_MB} MiB
           - VM vCPUs: $VM_VCPUS
           - Acceleration: $ACCELERATION_NAME
           - Guest disk: 32 GiB dynamically allocated QCOW2
-
-          This validates that the ISO can start in a $FIRMWARE_NAME x64 VM long enough
-          to produce three display captures. It does not certify Toshiba-specific
-          drivers, battery behavior, Wi-Fi, sound, sleep, or long-term installation
-          stability.
           EOF
 
           cleanup() {
@@ -227,18 +221,13 @@ jobs:
           ## Result
 
           **PASS — the guest remained running and produced all three screenshots.**
-
-          Review the screenshots and `qemu-serial.log` before installing on physical
-          hardware. Keep a Windows 10 or Linux recovery option available because
-          bypassing Windows 11 checks does not add missing firmware, memory, CPU
-          instructions, or device drivers.
           EOF
 
       - name: Upload ISO validation screenshots and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tiny11-iso-validation-${{ github.event.workflow_run.id }}-${{ matrix.firmware }}
+          name: tiny11-iso-validation-manual-${{ matrix.firmware }}
           path: validation-output
           if-no-files-found: warn
           retention-days: 14
