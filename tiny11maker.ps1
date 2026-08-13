@@ -147,9 +147,30 @@ if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$Driv
 }
 
 Write-Output "Copying Windows image..."
-Copy-Item -Path "$DriveLetter\*" -Destination "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
+& robocopy "$DriveLetter\" "$ScratchDisk\tiny11" /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ
+$robocopyExitCode = $LASTEXITCODE
+if ($robocopyExitCode -gt 7) {
+    throw "Copying Windows installation media failed. robocopy exit code: $robocopyExitCode"
+}
+Write-Output "Windows installation media copied with robocopy exit code $robocopyExitCode."
 Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1
 Remove-Item "$ScratchDisk\tiny11\sources\install.esd" > $null 2>&1
+foreach ($requiredBootFile in @(
+    "$ScratchDisk\tiny11\boot\etfsboot.com",
+    "$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin",
+    "$ScratchDisk\tiny11\sources\boot.wim"
+)) {
+    if (-not (Test-Path -LiteralPath $requiredBootFile -PathType Leaf)) {
+        throw "Required boot file was not copied to the build tree: $requiredBootFile"
+    }
+    $requiredBootFileInfo = Get-Item -LiteralPath $requiredBootFile
+    Write-Output "Copied boot file: $($requiredBootFileInfo.FullName) ($($requiredBootFileInfo.Length) bytes)"
+}
+$efiSysPath = "$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin"
+$efiSysSize = (Get-Item -LiteralPath $efiSysPath).Length
+if ($efiSysSize -lt 65536) {
+    throw "Copied efisys.bin is unexpectedly small ($efiSysSize bytes); refusing to create a non-UEFI ISO."
+}
 Write-Output "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
@@ -449,11 +470,12 @@ Write-Output "Copying unattended file for bypassing MS account on OOBE..."
 Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\tiny11\autounattend.xml" -Force | Out-Null
 Write-Output "Creating ISO image..."
 $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$hostarchitecture\Oscdimg"
+$adkOSCDIMGPath = Join-Path $ADKDepTools "oscdimg.exe"
 $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
-if ([System.IO.Directory]::Exists($ADKDepTools)) {
+if (Test-Path -LiteralPath $adkOSCDIMGPath -PathType Leaf) {
     Write-Output "Will be using oscdimg.exe from system ADK."
-    $OSCDIMG = "$ADKDepTools\oscdimg.exe"
+    $OSCDIMG = $adkOSCDIMGPath
 } else {
     Write-Output "ADK folder not found. Will be using bundled oscdimg.exe."
     $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
@@ -475,7 +497,33 @@ if ([System.IO.Directory]::Exists($ADKDepTools)) {
     $OSCDIMG = $localOSCDIMGPath
 }
 
+foreach ($isoBootFile in @(
+    "$ScratchDisk\tiny11\boot\etfsboot.com",
+    "$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin"
+)) {
+    if (-not (Test-Path -LiteralPath $isoBootFile -PathType Leaf)) {
+        throw "Cannot create ISO because boot file is missing: $isoBootFile"
+    }
+}
+$oscdimgInfo = Get-Item -LiteralPath $OSCDIMG
+if ($oscdimgInfo.Length -lt 32768) {
+    throw "oscdimg.exe is unexpectedly small ($($oscdimgInfo.Length) bytes): $OSCDIMG"
+}
+
+Remove-Item -LiteralPath "$PSScriptRoot\tiny11.iso" -Force -ErrorAction SilentlyContinue
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
+$oscdimgExitCode = $LASTEXITCODE
+if ($oscdimgExitCode -ne 0) {
+    throw "oscdimg.exe failed with exit code $oscdimgExitCode."
+}
+if (-not (Test-Path -LiteralPath "$PSScriptRoot\tiny11.iso" -PathType Leaf)) {
+    throw "oscdimg.exe reported success but did not create $PSScriptRoot\tiny11.iso"
+}
+$outputIsoInfo = Get-Item -LiteralPath "$PSScriptRoot\tiny11.iso"
+if ($outputIsoInfo.Length -lt 1048576) {
+    throw "Generated ISO is unexpectedly small ($($outputIsoInfo.Length) bytes)."
+}
+Write-Output "Generated bootable ISO: $($outputIsoInfo.FullName) ($($outputIsoInfo.Length) bytes)"
 
 # Finishing up
 Write-Output "Creation completed! Press any key to exit the script..."

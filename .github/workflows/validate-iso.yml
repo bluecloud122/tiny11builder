@@ -2,6 +2,12 @@ name: Validate built Tiny11 ISO
 
 on:
   workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: "Optional build artifact ID; blank selects the newest non-expired windows-prime-like-iso artifact"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -26,19 +32,53 @@ jobs:
           set -euo pipefail
           mkdir -p input
           
-          echo "Downloading artifact from GitHub API..."
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -o input/artifact.zip \
-            "https://api.github.com/repos/bluecloud122/tiny11builder/actions/artifacts/9192733079/zip"
+           api_url="https://api.github.com/repos/bluecloud122/tiny11builder"
+           auth_header="Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+           artifact_id="${{ inputs.artifact_id }}"
+           if [[ -z "$artifact_id" ]]; then
+             echo "No artifact ID supplied; selecting the newest non-expired build artifact..."
+             artifact_id="$(
+               curl --fail --silent --show-error \
+                 -H "$auth_header" \
+                 -H "Accept: application/vnd.github+json" \
+                 -H "X-GitHub-Api-Version: 2022-11-28" \
+                 "$api_url/actions/artifacts?per_page=100" \
+                 | jq -r '
+                   [
+                     .artifacts[]
+                     | select(.name == "windows-prime-like-iso")
+                     | select(.expired == false)
+                     | select(.workflow_run.head_branch == "main")
+                   ]
+                   | sort_by(.created_at)
+                   | last
+                   | .id // empty
+                 '
+             )"
+           fi
 
-          if [[ -f input/artifact.zip ]]; then
-            echo "Unzipping downloaded artifact..."
-            unzip -o input/artifact.zip -d input/
-            rm input/artifact.zip
-          fi
+           if ! [[ "$artifact_id" =~ ^[0-9]+$ ]]; then
+             echo "Could not resolve a valid windows-prime-like-iso artifact ID." >&2
+             exit 1
+           fi
+           echo "Selected build artifact ID: $artifact_id"
+           printf 'VALIDATED_ARTIFACT_ID=%s\n' "$artifact_id" >> "$GITHUB_ENV"
+
+           curl --fail --location \
+             -H "$auth_header" \
+             -H "Accept: application/vnd.github+json" \
+             -H "X-GitHub-Api-Version: 2022-11-28" \
+             -o input/artifact.zip \
+             "$api_url/actions/artifacts/$artifact_id/zip"
+
+           echo "Unzipping downloaded artifact..."
+           unzip -o input/artifact.zip -d input/
+           rm input/artifact.zip
+           build_info="$(find input -type f -name 'tiny11-build-info.txt' -print -quit)"
+           if [[ -n "$build_info" ]]; then
+             echo "Build metadata:"
+             cat "$build_info"
+           fi
 
       - name: Locate and hash the ISO
         shell: bash
@@ -101,7 +141,8 @@ jobs:
           mkdir -p "$REPORT_DIR"
           FIRMWARE_ARGS=()
           MACHINE_ARGS=( -machine pc )
-          ISO_BOOT_REPORT="$REPORT_DIR/iso-boot-report.txt"
+           ISO_BOOT_REPORT="$REPORT_DIR/iso-boot-report.txt"
+           EFI_FILE_REPORT="$REPORT_DIR/efi-file-report.txt"
 
           # Record the El Torito boot catalog before launching QEMU. This makes
           # a missing UEFI entry fail explicitly instead of falling through to
@@ -112,6 +153,25 @@ jobs:
               cat "$ISO_BOOT_REPORT" >&2
               exit 1
           }
+
+           # Confirm that the EFI boot payload exists in the ISO and was not
+           # reduced to the 512-byte placeholder produced by a bad source copy.
+           xorriso -indev "$ISO_PATH" \
+             -find / -type f -exec lsdl \
+             > "$EFI_FILE_REPORT" 2>&1 || {
+               echo "Could not inspect efisys.bin inside the ISO." >&2
+               cat "$EFI_FILE_REPORT" >&2
+               exit 1
+             }
+           efi_size="$(
+             awk 'tolower($NF) ~ /efisys\.bin$/ { print $5; exit }' "$EFI_FILE_REPORT"
+           )"
+           if ! [[ "$efi_size" =~ ^[0-9]+$ ]] || (( efi_size < 65536 )); then
+             echo "The ISO contains an invalid efisys.bin payload (${efi_size:-missing} bytes)." >&2
+             cat "$EFI_FILE_REPORT" >&2
+             exit 1
+           fi
+           echo "ISO efisys.bin size: $efi_size bytes"
 
           if [[ "$VM_FIRMWARE" == "uefi" ]]; then
             OVMF_DIR="/usr/share/OVMF"
@@ -159,7 +219,7 @@ jobs:
           # Tiny11 ISO boot validation
 
           - Firmware: $FIRMWARE_NAME
-          - Source ISO: Downloaded via artifact ID 9192733079
+           - Source ISO: Downloaded via build artifact ID $VALIDATED_ARTIFACT_ID
           - VM CPU model: \`$VM_CPU_MODEL\` (Broadwell-class)
           - VM memory: ${VM_MEMORY_MB} MiB
           - VM vCPUs: $VM_VCPUS

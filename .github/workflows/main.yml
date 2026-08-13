@@ -76,7 +76,7 @@ jobs:
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path $file)) {
-              Write-Warning "File missing: $file"
+              throw "Required builder file is missing: $file"
             }
           }
 
@@ -176,6 +176,23 @@ jobs:
           $mediaDrive = $mediaDriveLetter + ":\\"
           Write-Host "Detected ISO Drive: $mediaDrive"
 
+           $requiredBootFiles = @(
+             (Join-Path $mediaDrive "boot\etfsboot.com"),
+             (Join-Path $mediaDrive "efi\microsoft\boot\efisys.bin"),
+             (Join-Path $mediaDrive "sources\boot.wim")
+           )
+           foreach ($bootFile in $requiredBootFiles) {
+             if (-not (Test-Path -LiteralPath $bootFile -PathType Leaf)) {
+               throw "Required Windows boot file is missing from the mounted ISO: $bootFile"
+             }
+             $bootFileInfo = Get-Item -LiteralPath $bootFile
+             Write-Host "Boot file: $($bootFileInfo.FullName) ($($bootFileInfo.Length) bytes)"
+           }
+           $efiSize = (Get-Item -LiteralPath (Join-Path $mediaDrive "efi\microsoft\boot\efisys.bin")).Length
+           if ($efiSize -lt 65536) {
+             throw "The source efisys.bin is unexpectedly small ($efiSize bytes); refusing to build a non-UEFI ISO."
+           }
+
           $imagePath = @(
             (Join-Path $mediaDrive "sources\install.wim"),
             (Join-Path $mediaDrive "sources\install.esd")
@@ -236,6 +253,7 @@ jobs:
         shell: powershell
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
+           $ErrorActionPreference = "Stop"
           
           if ($env:TINY11_PROFILE -eq "Core") {
             Write-Host "Building Core Profile..."
