@@ -47,6 +47,13 @@ jobs:
     timeout-minutes: 150
 
     steps:
+      - name: Free Disk Space on Runner
+        shell: powershell
+        run: |
+          Write-Host "Freeing up disk space on C: drive..."
+          Get-ChildItem -Path C:\Android, C:\hostedtoolcache\Java, C:\hostedtoolcache\Ruby, C:\hostedtoolcache\Go -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Disk space freed successfully."
+
       - name: Check out this workflow
         uses: actions/checkout@v4
 
@@ -111,49 +118,24 @@ jobs:
 
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           Write-Host "Downloading the official ISO from $($uri.DnsSafeHost)..."
-          Write-Host "This is the full Microsoft source ISO; the trimmed output is created after this step."
 
-          $curlArguments = @(
-            "--fail",
-            "--location",
-            "--retry", "5",
-            "--retry-all-errors",
-            "--connect-timeout", "30",
-            "--progress-bar",
-            "--output", $isoPath,
+          # تشغيل curl المباشر مع تفعيل الاستئناف التلقائي (-C -) وإعادة المحاولة
+          curl.exe --fail `
+            --location `
+            -C - `
+            --retry 10 `
+            --retry-all-errors `
+            --retry-delay 5 `
+            --connect-timeout 60 `
+            --output $isoPath `
             $env:ISO_URL
-          )
-          $download = Start-Process -FilePath "curl.exe" `
-            -ArgumentList $curlArguments `
-            -NoNewWindow `
-            -PassThru
 
-          $lastBytes = 0L
-          $lastReport = Get-Date
-          while (-not $download.HasExited) {
-            Start-Sleep -Seconds 15
-            $download.Refresh()
-            $currentBytes = if (Test-Path $isoPath) {
-              (Get-Item $isoPath).Length
-            } else {
-              0L
-            }
-            $elapsed = ((Get-Date) - $lastReport).TotalSeconds
-            $rate = if ($elapsed -gt 0) {
-              ($currentBytes - $lastBytes) / $elapsed
-            } else {
-              0
-            }
-            Write-Host ("ISO download progress: {0:N2} GiB written; current rate {1:N1} MiB/s" -f `
-              ($currentBytes / 1GB), ($rate / 1MB))
-            $lastBytes = $currentBytes
-            $lastReport = Get-Date
-          }
-          $download.WaitForExit()
-          if ($download.ExitCode -ne 0) {
-            throw "curl.exe failed to download the ISO with exit code $($download.ExitCode)."
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "curl.exe failed to download the ISO with exit code $exitCode."
           }
 
+          Write-Host "Verifying ISO SHA-256..."
           $actualHash = (Get-FileHash $isoPath -Algorithm SHA256).Hash.ToUpperInvariant()
           if ($actualHash -ne $expectedHash) {
             Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
@@ -219,8 +201,6 @@ jobs:
           $env:TINY11_MEDIA_DRIVE = $drive
           Write-Host "Selected image index $env:TINY11_IMAGE_INDEX`: $($selected.ImageName)"
 
-          # Make the upstream builders non-interactive for CI. The Core builder
-          # also has a few legacy paths/prompts that need CI-safe replacements.
           $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
           $makerContent = Get-Content $makerPath -Raw
           $makerContent = $makerContent.Replace(
