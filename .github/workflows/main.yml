@@ -138,80 +138,97 @@ jobs:
         run: |
           $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
           
-          # 1. التقاط الأقراص الموجودة بالنظام قبل الـ Mount
-          $beforeDrives = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
-          
+          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11.iso"
+          if (-not (Test-Path -LiteralPath $isoPath)) {
+            throw "Windows ISO was not found at $isoPath"
+          }
+
           Write-Host "Mounting ISO dynamically..."
-          Mount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue | Out-Null
-          Start-Sleep -Seconds 5
+          $beforeLetters = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name)
+          Mount-DiskImage -ImagePath $isoPath -PassThru -ErrorAction Stop | Out-Null
+          Start-Sleep -Seconds 3
 
-          # 2. جلب الحرف المخصص للـ ISO مع استبعاد قرص C
-          $afterDrives = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
-          $newDrive = ($afterDrives | Where-Object { $beforeDrives -notcontains $_ -and $_ -ne 'C' }) | Select-Object -First 1
+          $mediaDriveLetter = (Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue |
+            Get-Disk -ErrorAction SilentlyContinue |
+            Get-Partition -ErrorAction SilentlyContinue |
+            Get-Volume -ErrorAction SilentlyContinue |
+            Where-Object { $_.DriveLetter } |
+            Select-Object -First 1).DriveLetter
 
-          if (-not $newDrive) {
-            $newDrive = (Get-Volume | Where-Object { $_.DriveType -eq 'CD-ROM' -and $_.DriveLetter -and $_.DriveLetter -ne 'C' } | Select-Object -First 1).DriveLetter
+          if (-not $mediaDriveLetter) {
+            $afterLetters = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name)
+            $mediaDriveLetter = $afterLetters |
+              Where-Object { $beforeLetters -notcontains $_ -and $_ -ne "C" } |
+              Select-Object -First 1
           }
 
-          if (-not $newDrive) {
-            $newDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -ne 'C' -and (Test-Path "$($_.Name):\sources") } | Select-Object -First 1).Name
+          if (-not $mediaDriveLetter) {
+            $mediaDriveLetter = (Get-Volume |
+              Where-Object { $_.DriveType -eq "CD-ROM" -and $_.DriveLetter -and $_.DriveLetter -ne "C" } |
+              Select-Object -First 1).DriveLetter
           }
 
-          if (-not $newDrive) {
-            throw "Dynamic Drive Detection Failed: Could not identify mounted ISO drive."
+          if (-not $mediaDriveLetter) {
+            throw "Dynamic Drive Detection Failed: Could not identify the mounted ISO drive."
           }
 
-          $mediaDrive = "$newDrive`:"
+          $mediaDriveLetter = ([string]$mediaDriveLetter).Trim().TrimEnd(":").Substring(0, 1).ToUpperInvariant()
+          $mediaDrive = $mediaDriveLetter + ":"
           Write-Host "Detected ISO Drive: $mediaDrive"
 
-          # 3. التأكد من ملف الصورة
-          $imagePath = Get-ChildItem -Path "$mediaDrive\sources" -Include "install.wim", "install.esd" -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          $imagePath = @(
+            "$mediaDrive\sources\install.wim",
+            "$mediaDrive\sources\install.esd"
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
           if (-not $imagePath) {
-            throw "No valid install.wim or install.esd found in $mediaDrive"
+            throw "No install.wim or install.esd found in $mediaDrive\sources"
           }
 
-          # 4. تحديد الإصدار المطلوب (Edition)
-          $images = @(Get-WindowsImage -ImagePath $imagePath)
+          $images = @(Get-WindowsImage -ImagePath $imagePath -ErrorAction Stop)
+          if ($images.Count -eq 0) {
+            throw "No Windows images were found in $imagePath"
+          }
+
+          $targetEdition = $env:TARGET_EDITION
+          if ([string]::IsNullOrWhiteSpace($targetEdition)) {
+            $targetEdition = "Pro"
+          }
           $selected = $images | Where-Object {
-            $_.ImageName -like "*$env:TARGET_EDITION*" -or
-            $_.ImageDescription -like "*$env:TARGET_EDITION*"
+            $_.ImageName -like "*$targetEdition*" -or
+            $_.ImageDescription -like "*$targetEdition*"
           } | Select-Object -First 1
 
           if (-not $selected) {
-            Write-Warning "Target edition '$env:TARGET_EDITION' not strictly matched. Defaulting to first available image index."
-            $selected = $images[0]
+            Write-Warning "Target edition '$targetEdition' was not strictly matched. Using image index 1."
+            $selected = $images | Select-Object -First 1
           }
 
           $env:TINY11_IMAGE_INDEX = [string]$selected.ImageIndex
-          $env:TINY11_MEDIA_DRIVE = $mediaDrive
+          $env:TINY11_MEDIA_DRIVE = $mediaDriveLetter
           Write-Host "Selected Image Index: $env:TINY11_IMAGE_INDEX ($($selected.ImageName))"
 
-          # 5. تعديل السكريبتات وتمرير الحرف ورقم الإصدار بدون أسئلة تفاعلية
-          $makerPath = Join-Path $PWD "tiny11builder\tiny11maker.ps1"
-          if (Test-Path $makerPath) {
-            $content = Get-Content $makerPath -Raw
-            $content = [Regex]::Replace($content, '(\$driveLetter\s*=\s*)Read-Host[^\r\n]*', "`$1 `"$env:TINY11_MEDIA_DRIVE`"")
-            $content = [Regex]::Replace($content, '(\$index\s*=\s*)Read-Host[^\r\n]*', "`$1 [int]$env:TINY11_IMAGE_INDEX")
-            $content = [Regex]::Replace($content, 'C:\\scratchdir', '$mainOSDrive\scratchdir')
-            $content = [Regex]::Replace($content, 'Read-Host[^\r\n]*', '"y"')
-            Set-Content -Path $makerPath -Value $content -Encoding UTF8
-          }
-
-          $corePath = Join-Path $PWD "tiny11builder\tiny11Coremaker.ps1"
-          if (Test-Path $corePath) {
-            $content = Get-Content $corePath -Raw
-            $content = [Regex]::Replace($content, '(\$DriveLetter\s*=\s*)Read-Host[^\r\n]*', "`$1 `"$env:TINY11_MEDIA_DRIVE`"")
-            $content = [Regex]::Replace($content, '(\$index\s*=\s*)Read-Host[^\r\n]*', "`$1 [int]$env:TINY11_IMAGE_INDEX")
-            $content = [Regex]::Replace($content, 'Read-Host[^\r\n]*', '"y"')
-            Set-Content -Path $corePath -Value $content -Encoding UTF8
+          # Make the checked-out builders non-interactive without changing their source repository.
+          $builderFiles = @(
+            (Join-Path $PWD "tiny11builder\tiny11maker.ps1"),
+            (Join-Path $PWD "tiny11builder\tiny11Coremaker.ps1")
+          )
+          foreach ($builderFile in $builderFiles) {
+            if (-not (Test-Path -LiteralPath $builderFile)) {
+              throw "Builder script not found: $builderFile"
+            }
+            $content = Get-Content -LiteralPath $builderFile -Raw
+            $content = $content.Replace('$DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"', '$DriveLetter = $env:TINY11_MEDIA_DRIVE')
+            $content = $content.Replace('$index = Read-Host "Please enter the image index"', '$index = [int]$env:TINY11_IMAGE_INDEX')
+            $content = $content.Replace('$input = Read-Host', '$input = "y"')
+            $content = [regex]::Replace($content, 'Read-Host[^\r\n]*', '"y"')
+            Set-Content -LiteralPath $builderFile -Value $content -Encoding UTF8
           }
 
           "TINY11_IMAGE_INDEX=$env:TINY11_IMAGE_INDEX" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "TINY11_MEDIA_DRIVE=$env:TINY11_MEDIA_DRIVE" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "TINY11_LOW_RAM=${{ inputs.low_ram }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "TINY11_PROFILE=$env:BUILD_PROFILE" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
+          "TINY11_LOW_RAM=\${{ inputs.low_ram }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TINY11_PROFILE=\${{ inputs.profile }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build the selected image profile
         shell: powershell
         run: |
