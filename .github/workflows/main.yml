@@ -6,10 +6,12 @@ on:
       iso_url:
         description: "Direct HTTPS URL for the official Microsoft Windows 11 ISO"
         required: true
+        default: "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
         type: string
       iso_sha256:
         description: "SHA-256 of the ISO, copied from Microsoft's download information"
         required: true
+        default: "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3"
         type: string
       edition:
         description: "Edition to keep in the final image"
@@ -82,6 +84,7 @@ jobs:
           $trustedHosts = @(
             "download.microsoft.com",
             "software.download.prss.microsoft.com",
+            "software-static.download.prss.microsoft.com",
             "software-download.microsoft.com"
           )
 
