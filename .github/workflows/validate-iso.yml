@@ -1,6 +1,7 @@
 name: Validate built Tiny11 ISO
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows:
       - Build Windows Prime-like ISO
