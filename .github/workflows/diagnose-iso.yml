@@ -1,0 +1,147 @@
+name: Diagnose Tiny11 ISO boot catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: "Artifact ID to inspect; blank selects the newest build artifact"
+        required: false
+        default: "9201206561"
+        type: string
+  workflow_run:
+    workflows: ["Build Windows Prime-like ISO"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  diagnose:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ISO inspection tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq xorriso p7zip-full file
+
+      - name: Download selected build artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_ARTIFACT_ID: ${{ inputs.artifact_id }}
+          BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+          API_URL: https://api.github.com/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p input diagnostics
+          artifact_id="$REQUESTED_ARTIFACT_ID"
+
+          if [[ -z "$artifact_id" && -n "$BUILD_RUN_ID" ]]; then
+            artifact_id="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$API_URL/actions/runs/$BUILD_RUN_ID/artifacts" \
+              | jq -r '.artifacts[] | select(.name == "windows-prime-like-iso" and .expired == false) | .id' \
+              | head -n 1)"
+          fi
+
+          if [[ -z "$artifact_id" ]]; then
+            artifact_id="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$API_URL/actions/artifacts?per_page=100" \
+              | jq -r '[.artifacts[] | select(.name == "windows-prime-like-iso" and .expired == false)] | sort_by(.created_at) | last.id // empty')"
+          fi
+
+          if ! [[ "$artifact_id" =~ ^[0-9]+$ ]]; then
+            echo "No valid ISO artifact was found." >&2
+            exit 1
+          fi
+
+          echo "Inspecting artifact: $artifact_id"
+          echo "ARTIFACT_ID=$artifact_id" >> "$GITHUB_ENV"
+          curl --fail --location --retry 5 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -o input/artifact.zip "$API_URL/actions/artifacts/$artifact_id/zip"
+          unzip -q input/artifact.zip -d input
+          iso="$(find input -type f -iname '*.iso' -print -quit)"
+          [[ -n "$iso" ]] || { echo "Artifact contains no ISO." >&2; exit 1; }
+          echo "ISO_PATH=$iso" >> "$GITHUB_ENV"
+          stat -c 'ISO size: %s bytes' "$iso" | tee diagnostics/iso-size.txt
+          file "$iso" | tee diagnostics/iso-file.txt
+
+      - name: Inspect El Torito catalog and embedded boot images
+        env:
+          ISO_PATH: ${{ env.ISO_PATH }}
+        run: |
+          set -uo pipefail
+          mkdir -p diagnostics/boot-images
+          {
+            echo '### xorriso El Torito report'
+            xorriso -indev "$ISO_PATH" -report_el_torito plain -report_system_area plain
+            echo
+            echo '### xorriso boot command report'
+            xorriso -indev "$ISO_PATH" -report_el_torito cmd
+            echo
+            echo '### xorriso table of contents'
+            xorriso -indev "$ISO_PATH" -toc
+          } > diagnostics/xorriso-report.txt 2>&1 || true
+
+          xorriso -osirrox on -indev "$ISO_PATH" \
+            -extract_boot_images diagnostics/boot-images \
+            > diagnostics/extract-boot-images.txt 2>&1 || true
+
+          xorriso -osirrox on -indev "$ISO_PATH" \
+            -extract /efi/microsoft/boot/efisys.bin diagnostics/tree-efisys.bin \
+            > diagnostics/extract-tree-efisys.txt 2>&1 || true
+
+          {
+            echo '### extracted files'
+            find diagnostics -type f -printf '%p %s bytes\n' | sort
+            echo
+            echo '### file signatures'
+            find diagnostics -type f -print0 | xargs -0 -r file
+            echo
+            echo '### hashes'
+            find diagnostics -type f -print0 | sort -z | xargs -0 -r sha256sum
+          } > diagnostics/file-report.txt 2>&1 || true
+
+          cat diagnostics/xorriso-report.txt
+          cat diagnostics/file-report.txt
+
+      - name: Publish diagnosis
+        if: always()
+        run: |
+          {
+            echo '# Tiny11 ISO boot diagnosis'
+            echo
+            echo "- Artifact ID: \\`${ARTIFACT_ID:-unknown}\\`"
+            echo "- ISO: \\`${ISO_PATH:-unknown}\\`"
+            echo
+            echo '## El Torito report'
+            echo '```text'
+            cat diagnostics/xorriso-report.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo '## Extracted boot image files'
+            echo '```text'
+            cat diagnostics/file-report.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ISO diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-iso-boot-diagnosis-${{ github.run_id }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 14
