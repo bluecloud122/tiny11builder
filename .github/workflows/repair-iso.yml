@@ -1,0 +1,182 @@
+name: Repair Tiny11 ISO boot catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: "Source build artifact ID; blank selects the latest build artifact"
+        required: false
+        default: "9201206561"
+        type: string
+  workflow_run:
+    workflows: ["Build Windows Prime-like ISO"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  repair:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ISO tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq xorriso p7zip-full file
+
+      - name: Download source ISO artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_ARTIFACT_ID: ${{ inputs.artifact_id }}
+          BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+          API_URL: https://api.github.com/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p input output reports
+          artifact_id="$REQUESTED_ARTIFACT_ID"
+
+          if [[ -z "$artifact_id" && -n "$BUILD_RUN_ID" ]]; then
+            artifact_id="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$API_URL/actions/runs/$BUILD_RUN_ID/artifacts" \
+              | jq -r '.artifacts[] | select(.name == "windows-prime-like-iso" and .expired == false) | .id' \
+              | head -n 1)"
+          fi
+
+          if [[ -z "$artifact_id" ]]; then
+            artifact_id="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$API_URL/actions/artifacts?per_page=100" \
+              | jq -r '[.artifacts[] | select(.name == "windows-prime-like-iso" and .expired == false)] | sort_by(.created_at) | last.id // empty')"
+          fi
+
+          if ! [[ "$artifact_id" =~ ^[0-9]+$ ]]; then
+            echo "No valid source ISO artifact found." >&2
+            exit 1
+          fi
+          echo "Source artifact: $artifact_id"
+          echo "SOURCE_ARTIFACT_ID=$artifact_id" >> "$GITHUB_ENV"
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -o input/artifact.zip "$API_URL/actions/artifacts/$artifact_id/zip"
+          unzip -q input/artifact.zip -d input
+          source_iso="$(find input -type f -iname '*.iso' -print -quit)"
+          [[ -n "$source_iso" ]] || { echo "Source artifact contains no ISO." >&2; exit 1; }
+          echo "SOURCE_ISO=$source_iso" >> "$GITHUB_ENV"
+          stat -c 'Source ISO: %n (%s bytes)' "$source_iso" | tee reports/source-size.txt
+
+      - name: Rebuild ISO with a valid BIOS and UEFI catalog
+        env:
+          SOURCE_ISO: ${{ env.SOURCE_ISO }}
+        run: |
+          set -euo pipefail
+          mkdir -p tree
+
+          # Extract the ISO filesystem. The original hidden El Torito entries are
+          # deliberately not reused; xorriso will create a fresh catalog from the
+          # visible Windows boot files.
+          xorriso -osirrox on -indev "$SOURCE_ISO" \
+            -extract / tree \
+            > reports/extract-tree.txt 2>&1
+
+          for boot_file in tree/boot/etfsboot.com tree/efi/microsoft/boot/efisys.bin tree/sources/boot.wim; do
+            if [[ ! -f "$boot_file" ]]; then
+              echo "Missing required file after ISO extraction: $boot_file" >&2
+              exit 1
+            fi
+          done
+
+          efi_size=$(stat -c '%s' tree/efi/microsoft/boot/efisys.bin)
+          if (( efi_size < 65536 )); then
+            echo "Extracted efisys.bin is unexpectedly small: $efi_size bytes" >&2
+            exit 1
+          fi
+          echo "Extracted efisys.bin: $efi_size bytes" | tee reports/boot-file-sizes.txt
+          stat -c '%n: %s bytes' tree/boot/etfsboot.com tree/efi/microsoft/boot/efisys.bin tree/sources/boot.wim \
+            | tee -a reports/boot-file-sizes.txt
+
+          xorriso -as mkisofs \
+            -iso-level 3 \
+            -udf \
+            -joliet -joliet-long \
+            -l \
+            -volid 'CD_ROM' \
+            -b 'boot/etfsboot.com' \
+            -no-emul-boot \
+            -boot-load-size 8 \
+            -boot-info-table \
+            -eltorito-alt-boot \
+            -eltorito-platform efi \
+            -e 'efi/microsoft/boot/efisys.bin' \
+            -no-emul-boot \
+            -o output/tiny11-repaired.iso \
+            tree \
+            2>&1 | tee reports/xorriso-create.txt
+
+          [[ -s output/tiny11-repaired.iso ]] || { echo "xorriso did not create an ISO." >&2; exit 1; }
+          stat -c 'Repaired ISO: %n (%s bytes)' output/tiny11-repaired.iso | tee reports/repaired-size.txt
+
+      - name: Validate repaired boot catalog
+        run: |
+          set -euo pipefail
+          xorriso -indev output/tiny11-repaired.iso \
+            -report_el_torito plain \
+            -report_system_area plain \
+            > reports/repaired-xorriso-report.txt 2>&1
+          cat reports/repaired-xorriso-report.txt
+
+          # Do not accept the exact broken signature from the source ISO.
+          if grep -Eq 'EFI image start and size: .*1 \* 512|El Torito boot img :[[:space:]]+2[[:space:]]+UEFI.*Ldsiz[[:space:]]+1([[:space:]]|$)' reports/repaired-xorriso-report.txt; then
+            echo 'The repaired ISO still has a one-sector UEFI El Torito entry.' >&2
+            exit 1
+          fi
+
+          xorriso -osirrox on -indev output/tiny11-repaired.iso \
+            -extract_boot_images reports/repaired-boot-images \
+            > reports/repaired-extract-boot-images.txt 2>&1
+          find reports/repaired-boot-images -type f -printf '%p %s bytes\n' | sort \
+            | tee reports/repaired-boot-image-sizes.txt
+
+      - name: Write repair summary
+        if: always()
+        run: |
+          {
+            echo '# Tiny11 ISO repair'
+            echo
+            echo "- Source artifact: \\`${SOURCE_ARTIFACT_ID:-unknown}\\`"
+            echo '- Repack tool: `xorriso -as mkisofs`'
+            echo '- Output: `tiny11-repaired.iso`'
+            echo
+            echo '## Repaired El Torito report'
+            echo '```text'
+            cat reports/repaired-xorriso-report.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo '## Boot image sizes'
+            echo '```text'
+            cat reports/repaired-boot-image-sizes.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload repaired ISO artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-prime-like-iso-repaired
+          path: |
+            output/tiny11-repaired.iso
+            reports
+          if-no-files-found: error
+          retention-days: 14
