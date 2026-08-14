@@ -91,20 +91,25 @@ jobs:
             -extract / tree \
             > reports/extract-tree.txt 2>&1
 
-          for boot_file in tree/boot/etfsboot.com tree/efi/microsoft/boot/efisys.bin tree/sources/boot.wim; do
-            if [[ ! -f "$boot_file" ]]; then
-              echo "Missing required file after ISO extraction: $boot_file" >&2
-              exit 1
-            fi
-          done
-
-          efi_size=$(stat -c '%s' tree/efi/microsoft/boot/efisys.bin)
+          bios_file=$(find tree -type f -iname 'etfsboot.com' -print -quit)
+          efi_file=$(find tree -type f -iname 'efisys.bin' -print -quit)
+          boot_wim=$(find tree -type f -iname 'boot.wim' -print -quit)
+          if [[ -z "$bios_file" || -z "$efi_file" || -z "$boot_wim" ]]; then
+            echo "Required boot files were not found after ISO extraction." >&2
+            find tree -maxdepth 5 -type f | sort | head -200 >&2 || true
+            exit 1
+          fi
+          bios_rel="${bios_file#tree/}"
+          efi_rel="${efi_file#tree/}"
+          efi_size=$(stat -c '%s' "$efi_file")
           if (( efi_size < 65536 )); then
             echo "Extracted efisys.bin is unexpectedly small: $efi_size bytes" >&2
             exit 1
           fi
-          echo "Extracted efisys.bin: $efi_size bytes" | tee reports/boot-file-sizes.txt
-          stat -c '%n: %s bytes' tree/boot/etfsboot.com tree/efi/microsoft/boot/efisys.bin tree/sources/boot.wim \
+          echo "BIOS boot path: $bios_rel" | tee reports/boot-file-sizes.txt
+          echo "UEFI boot path: $efi_rel" | tee -a reports/boot-file-sizes.txt
+          echo "Extracted efisys.bin: $efi_size bytes" | tee -a reports/boot-file-sizes.txt
+          stat -c '%n: %s bytes' "$bios_file" "$efi_file" "$boot_wim" \
             | tee -a reports/boot-file-sizes.txt
 
           xorriso -as mkisofs \
@@ -113,13 +118,13 @@ jobs:
             -joliet -joliet-long \
             -l \
             -volid 'CD_ROM' \
-            -b 'boot/etfsboot.com' \
+            -b "$bios_rel" \
             -no-emul-boot \
             -boot-load-size 8 \
             -boot-info-table \
             -eltorito-alt-boot \
             -eltorito-platform efi \
-            -e 'efi/microsoft/boot/efisys.bin' \
+            -e "$efi_rel" \
             -no-emul-boot \
             -o output/tiny11-repaired.iso \
             tree \
@@ -155,9 +160,9 @@ jobs:
           {
             echo '# Tiny11 ISO repair'
             echo
-            echo "- Source artifact: \\`${SOURCE_ARTIFACT_ID:-unknown}\\`"
-            echo '- Repack tool: `xorriso -as mkisofs`'
-            echo '- Output: `tiny11-repaired.iso`'
+            echo "- Source artifact: ${SOURCE_ARTIFACT_ID:-unknown}"
+            echo '- Repack tool: xorriso -as mkisofs'
+            echo '- Output: tiny11-repaired.iso'
             echo
             echo '## Repaired El Torito report'
             echo '```text'
