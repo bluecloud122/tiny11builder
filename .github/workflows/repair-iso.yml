@@ -84,12 +84,10 @@ jobs:
           set -euo pipefail
           mkdir -p tree
 
-          # Extract the ISO filesystem. The original hidden El Torito entries are
-          # deliberately not reused; xorriso will create a fresh catalog from the
-          # visible Windows boot files.
-          xorriso -osirrox on -indev "$SOURCE_ISO" \
-            -extract / tree \
-            > reports/extract-tree.txt 2>&1
+          # Extract the full ISO/UDF filesystem. The original hidden El Torito
+          # entries are deliberately not reused; xorriso will create a fresh
+          # catalog from the visible Windows boot files.
+          7z x -y "$SOURCE_ISO" -otree > reports/extract-tree.txt 2>&1
 
           bios_file=$(find tree -type f -iname 'etfsboot.com' -print -quit)
           efi_file=$(find tree -type f -iname 'efisys.bin' -print -quit)
